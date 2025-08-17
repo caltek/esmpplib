@@ -128,6 +128,8 @@ multi_part_messages_test(_Config) ->
 
     % send message successful -> async
 
+    timer:sleep(2000),
+
     MessageRef = make_ref(),
     ?assertEqual(ok,  esmpplib_connection:submit_sm_async(P, MessageRef, Src, Dst, MsgUcs2)),
     ?assertEqual(ok, ect_utils:wait_for_config_is_set({on_submit_sm_response_successful, MessageRef})),

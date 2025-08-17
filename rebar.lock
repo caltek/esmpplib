@@ -18,7 +18,7 @@
   0},
  {<<"smpp_parser">>,
   {git,"https://github.com/silviucpp/smpp_parser.git",
-       {ref,"69b2e6541f2bc5de3092441f6fb3e85f1960894f"}},
+       {ref,"3cdfca913f4c8cb4ab6689d394e1238d697643e8"}},
   0},
  {<<"tic">>,
   {git,"https://github.com/silviucpp/tic.git",
