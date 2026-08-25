@@ -39,12 +39,16 @@
 -callback on_connection_change_notification(Id::any(), Pid::pid(), IsConnected::boolean()) ->
     any().
 
+-callback on_mo_message(MessageId::binary()|undefined, SrcAddress::binary(), DstAddress::binary(), Message::binary(), DataCoding::non_neg_integer(), Args::any()) ->
+    any().
+
 -optional_callbacks([
     on_submit_sm_response_successful/3,
     on_submit_sm_response_failed/2,
     on_delivery_report/8,
     on_query_sm_response/3,
-    on_connection_change_notification/3
+    on_connection_change_notification/3,
+    on_mo_message/6
 ]).
 
 -export([
@@ -437,9 +441,9 @@ handle_deliver_sm_request({CmdId, Status, SeqNum, Body}, #state{id = Id, options
                     DlrArgs = maps:get(delivery_reports_args, Options, undefined),
                     run_callback(on_delivery_report, 8, [MessageId, SourceAddress, DestinationAddress, SubmitDate, DoneDate, DlrStatus, ErrorCode, DlrArgs], Options);
                 _ ->
-                    case esmpplib_utils:lookup(receipted_message_id, Body) of
+                    case esmpplib_utils:lookup(receipted_message_id, Body, undefined) of
                         undefined ->
-                            ?ERROR_MSG("connection_id: ~p handle_deliver_sm_request failed to parse: ~p and receipted_message_id is missing.", [Id, Message]);
+                            handle_mo_message(Body, Options);
                         MessageId ->
                             DlrArgs = maps:get(delivery_reports_args, Options, undefined),
                             DlrStatus = esmpplib_msg_status:to_string(esmpplib_utils:lookup(message_state, Body, ?MESSAGE_STATE_UNKNOWN)),
@@ -457,6 +461,15 @@ handle_deliver_sm_request({CmdId, Status, SeqNum, Body}, #state{id = Id, options
             ?ERROR_MSG("connection_id: ~p handle_deliver_sm_request failed status: ~p", [Id, {Status, smpp_status2bin(Status), SeqNum, Body}]),
             State
     end.
+
+handle_mo_message(Body, Options) ->
+    Message = esmpplib_utils:lookup(short_message, Body),
+    DataCoding = esmpplib_utils:lookup(data_coding, Body),
+    SrcAddress = esmpplib_utils:lookup(source_addr, Body),
+    DstAddress = esmpplib_utils:lookup(destination_addr, Body),
+    MessageId = esmpplib_utils:lookup(message_id, Body, undefined),
+    MoArgs = maps:get(mo_message_args, Options, undefined),
+    run_callback(on_mo_message, 6, [MessageId, SrcAddress, DstAddress, Message, DataCoding, MoArgs], Options).
 
 handle_query_sm_response({_CmdId, Status, SeqNum, Body}, #state{reply_map = ReplyMap, options = Options, pending_req_queue = PendingRqQueue} = State) ->
     case maps:take(SeqNum, ReplyMap) of
@@ -670,6 +683,7 @@ default_options() -> #{
     service_type => <<"">>,
     data_coding => ?ENCODING_SCHEME_MC_SPECIFIC,
     callback_module => undefined,
+    mo_message_args => undefined,
     registered_delivery => ?REGISTERED_DELIVERY_MC_ALWAYS
 }.
 
