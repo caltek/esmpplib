@@ -58,6 +58,7 @@
     query_sm/2,
     query_sm_async/2,
     is_connected/1,
+    last_enquire_link_response/1,
     stop/1,
 
     init/1,
@@ -83,7 +84,8 @@
     binding_mode,
     enquire_link_timer,
     binding_timer,
-    pending_requests_timeout_timer
+    pending_requests_timeout_timer,
+    last_enquire_link_response
 }).
 
 start_link(Options) ->
@@ -103,6 +105,9 @@ query_sm_async(Pid, MessageId) ->
 
 is_connected(Pid) ->
     esmpplib_utils:safe_call(Pid, is_connected).
+
+last_enquire_link_response(Pid) ->
+    esmpplib_utils:safe_call(Pid, last_enquire_link_response).
 
 stop(Pid) ->
     esmpplib_utils:safe_call(Pid, stop).
@@ -221,6 +226,8 @@ handle_call({query_sm, MessageId, Async}, FromPid, #state{
     end;
 handle_call(is_connected, _From, #state{binding_mode = BindingMode} = State) ->
     {reply, {ok, BindingMode =/= undefined}, State};
+handle_call(last_enquire_link_response, _From, #state{last_enquire_link_response = T} = State) ->
+    {reply, {ok, T}, State};
 handle_call(stop, _From, #state{id = Id} = State) ->
     ?INFO_MSG("connection_id: ~p received stop signal", [Id]),
     {stop, normal, ok, State};
@@ -320,7 +327,7 @@ process_incoming_data(#state{id = Id, parser = Parser} = State, Data) ->
                 ?COMMAND_ID_ENQUIRE_LINK ->
                     handle_enquire_link_request(Pdu, State);
                 ?COMMAND_ID_ENQUIRE_LINK_RESP ->
-                    State;
+                    State#state{last_enquire_link_response = esmpplib_time:now_msec()};
                 BindCmd when ?IS_BIND_RESPONSE(BindCmd) ->
                     handle_binding_response(Pdu, State);
                 ?COMMAND_ID_UNBIND ->
@@ -378,7 +385,8 @@ handle_binding_response({CmdId, Status, _SeqNum, _Body}, #state{id = Id, options
                 binding_mode = BindingMode,
                 enquire_link_timer = schedule_enquire_link(Options),
                 binding_timer = undefined,
-                reconnect_attempts = 0
+                reconnect_attempts = 0,
+                last_enquire_link_response = esmpplib_time:now_msec()
             };
         _ ->
             ?ERROR_MSG("connection_id: ~p failed to bind with error: (~p) ~p", [Id, Status, smpp_status2bin(Status)]),
