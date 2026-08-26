@@ -69,6 +69,10 @@
     code_change/3
 ]).
 
+-ifdef(TEST).
+-export([test_process_incoming/2]).
+-endif.
+
 -record(state, {
     id,
     transport,
@@ -322,6 +326,8 @@ process_incoming_data(#state{id = Id, parser = Parser} = State, Data) ->
                     handle_submit_sm_response(Pdu, State);
                 ?COMMAND_ID_DELIVER_SM ->
                     handle_deliver_sm_request(Pdu, State);
+                ?COMMAND_ID_DATA_SM ->
+                    handle_data_sm_request(Pdu, State);
                 ?COMMAND_ID_QUERY_SM_RESP ->
                     handle_query_sm_response(Pdu, State);
                 ?COMMAND_ID_ENQUIRE_LINK ->
@@ -429,55 +435,128 @@ handle_submit_sm_response({_CmdId, Status, SeqNum, Body}, #state{reply_map = Rep
             State#state{pending_req_queue = esmpplib_pending_request_queue:ack(SeqNum, PendingReqQueue)}
     end.
 
-handle_deliver_sm_request({CmdId, Status, SeqNum, Body}, #state{id = Id, options = Options, transport = Transport, socket = Socket} = State) ->
-    ?INFO_MSG("connection_id: ~p handle_deliver_sm_request: status: ~p body: ~p", [Id, Status, Body]),
+handle_deliver_sm_request(Pdu, State) ->
+    handle_inbound_sm_request(deliver_sm, Pdu, State).
+
+handle_data_sm_request(Pdu, State) ->
+    handle_inbound_sm_request(data_sm, Pdu, State).
+
+handle_inbound_sm_request(Kind, {CmdId, Status, SeqNum, Body}, #state{id = Id, options = Options, transport = Transport, socket = Socket} = State) ->
+    ?INFO_MSG("connection_id: ~p handle_~p_request: status: ~p body: ~p", [Id, Kind, Status, Body]),
 
     send_command(Transport, Socket, {?MAKE_RESPONSE(CmdId), Status, SeqNum, []}),
 
     case Status of
         ?ESME_ROK ->
-            Message = esmpplib_utils:lookup(short_message, Body),
-            DataCoding = esmpplib_utils:lookup(data_coding, Body),
+            Message = inbound_message(Body),
+            DataCoding = esmpplib_utils:lookup(data_coding, Body, ?ENCODING_SCHEME_MC_SPECIFIC),
             SourceAddress = esmpplib_utils:lookup(destination_addr, Body),
             DestinationAddress = esmpplib_utils:lookup(source_addr, Body),
+            DecodedMessage = esmpplib_encoding:decode(DataCoding, Message),
 
-            case re:run(esmpplib_encoding:decode(DataCoding, Message), <<"id:(.*?) sub:(.*?) dlvrd:(.*?) (submit date:|submitdate:)(.*?) (done date:|donedate:)(.*?) stat:(.*?) err:(.*?) text:(.*?)">>, [{capture, all_but_first, binary}]) of
-                {match, [MessageId, _Submitted0, _Delivered0, _, SubmitDate0, _, DlrDate0, DlrStatus, ErrorCode0, _Text]} ->
+            case classify_delivery_report(Body, DecodedMessage) of
+                {text, MessageId, SubmitDate0, DlrDate0, DlrStatus, ErrorCode0} ->
                     SubmitDate = dlr_datetime2ts(SubmitDate0),
                     DoneDate = dlr_datetime2ts(DlrDate0),
                     ErrorCode = esmpplib_utils:safe_bin2int({Id, <<"err">>}, ErrorCode0, 0),
                     DlrArgs = maps:get(delivery_reports_args, Options, undefined),
                     run_callback(on_delivery_report, 8, [MessageId, SourceAddress, DestinationAddress, SubmitDate, DoneDate, DlrStatus, ErrorCode, DlrArgs], Options);
-                _ ->
-                    case esmpplib_utils:lookup(receipted_message_id, Body, undefined) of
-                        undefined ->
-                            handle_mo_message(Body, Options);
-                        MessageId ->
-                            DlrArgs = maps:get(delivery_reports_args, Options, undefined),
-                            DlrStatus = esmpplib_msg_status:to_string(esmpplib_utils:lookup(message_state, Body, ?MESSAGE_STATE_UNKNOWN)),
-                            ErrorCode = case esmpplib_utils:lookup(network_error_code, Body) of
-                                #network_error_code{error = Code} ->
-                                    Code;
-                                _ ->
-                                    0
-                            end,
-                            run_callback(on_delivery_report, 8, [MessageId, SourceAddress, DestinationAddress, null, null, DlrStatus, ErrorCode, DlrArgs], Options)
-                    end
+                {tlv, MessageId} ->
+                    DlrArgs = maps:get(delivery_reports_args, Options, undefined),
+                    DlrStatus = esmpplib_msg_status:to_string(esmpplib_utils:lookup(message_state, Body, ?MESSAGE_STATE_UNKNOWN)),
+                    ErrorCode = case esmpplib_utils:lookup(network_error_code, Body) of
+                        #network_error_code{error = Code} ->
+                            Code;
+                        _ ->
+                            0
+                    end,
+                    run_callback(on_delivery_report, 8, [MessageId, SourceAddress, DestinationAddress, null, null, DlrStatus, ErrorCode, DlrArgs], Options);
+                malformed_delivery_report ->
+                    ?ERROR_MSG("connection_id: ~p failed to parse delivery report: ~p", [Id, DecodedMessage]);
+                mo when Kind == deliver_sm ->
+                    handle_mo_message(Body, Message, Options);
+                mo ->
+                    ?WARNING_MSG("connection_id: ~p received unsupported non-delivery-report data_sm: ~p", [Id, Body])
             end,
             State;
         _ ->
-            ?ERROR_MSG("connection_id: ~p handle_deliver_sm_request failed status: ~p", [Id, {Status, smpp_status2bin(Status), SeqNum, Body}]),
+            ?ERROR_MSG("connection_id: ~p handle_~p_request failed status: ~p", [Id, Kind, {Status, smpp_status2bin(Status), SeqNum, Body}]),
             State
     end.
 
-handle_mo_message(Body, Options) ->
-    Message = esmpplib_utils:lookup(short_message, Body),
+inbound_message(Body) ->
+    esmpplib_utils:lookup(message_payload, Body, esmpplib_utils:lookup(short_message, Body, <<>>)).
+
+classify_delivery_report(Body, Message) ->
+    case parse_delivery_report(Message) of
+        {ok, MessageId, SubmitDate, DoneDate, Status, ErrorCode} ->
+            {text, MessageId, SubmitDate, DoneDate, Status, ErrorCode};
+        error ->
+            case esmpplib_utils:lookup(receipted_message_id, Body, undefined) of
+                MessageId when MessageId =/= undefined ->
+                    {tlv, MessageId};
+                undefined ->
+                    case is_mc_delivery_receipt(Body) of
+                        true ->
+                            malformed_delivery_report;
+                        false ->
+                            mo
+                    end
+            end
+    end.
+
+parse_delivery_report(Message) ->
+    Fields = {
+        delivery_report_field(Message, <<"(?:^|\\s)id:([^\\s]+)">>),
+        delivery_report_field(Message, <<"(?:^|\\s)(?:submit date|submitdate):([^\\s]+)">>),
+        delivery_report_field(Message, <<"(?:^|\\s)(?:done date|donedate):([^\\s]+)">>),
+        delivery_report_field(Message, <<"(?:^|\\s)stat:([^\\s]+)">>),
+        delivery_report_field(Message, <<"(?:^|\\s)err:([^\\s]+)">>)
+    },
+    case Fields of
+        {{ok, MessageId}, {ok, SubmitDate}, {ok, DoneDate}, {ok, Status}, {ok, ErrorCode}} ->
+            {ok, MessageId, SubmitDate, DoneDate, Status, ErrorCode};
+        _ ->
+            error
+    end.
+
+delivery_report_field(Message, Pattern) ->
+    case re:run(Message, Pattern, [{capture, all_but_first, binary}]) of
+        {match, [Value]} ->
+            {ok, Value};
+        _ ->
+            error
+    end.
+
+is_mc_delivery_receipt(Body) ->
+    case esmpplib_utils:lookup(esm_class, Body, ?ESM_CLASS_DEFAULT) of
+        EsmClass when is_integer(EsmClass) ->
+            EsmClass band 2#00111100 == ?ESM_CLASS_TYPE_MC_DELIVERY_RECEIPT;
+        _ ->
+            false
+    end.
+
+handle_mo_message(Body, Message, Options) ->
     DataCoding = esmpplib_utils:lookup(data_coding, Body),
     SrcAddress = esmpplib_utils:lookup(source_addr, Body),
     DstAddress = esmpplib_utils:lookup(destination_addr, Body),
     MessageId = esmpplib_utils:lookup(message_id, Body, undefined),
     MoArgs = maps:get(mo_message_args, Options, undefined),
     run_callback(on_mo_message, 6, [MessageId, SrcAddress, DstAddress, Message, DataCoding, MoArgs], Options).
+
+-ifdef(TEST).
+test_process_incoming(Data, Options) ->
+    process_incoming_data(test_state(Options), Data).
+
+test_state(Options) ->
+    #state{
+        id = test_connection,
+        transport = esmpplib_test_transport,
+        socket = self(),
+        parser = esmpplib_stream_parser:new(200000),
+        options = maps:merge(default_options(), Options)
+    }.
+-endif.
 
 handle_query_sm_response({_CmdId, Status, SeqNum, Body}, #state{reply_map = ReplyMap, options = Options, pending_req_queue = PendingRqQueue} = State) ->
     case maps:take(SeqNum, ReplyMap) of
